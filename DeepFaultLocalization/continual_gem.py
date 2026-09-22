@@ -4,6 +4,7 @@ import argparse
 import math
 import os
 import sys
+import time
 
 import numpy as np
 import tensorflow.compat.v1 as tf
@@ -215,6 +216,7 @@ def main():
         print("warmup 需满足 1 <= warmup < v_end", file=sys.stderr)
         sys.exit(1)
 
+    t0 = time.time()
     ut.apply_deepfl_env_from_args(args)
     import config as cfg  # noqa: F401
 
@@ -232,7 +234,9 @@ def main():
         args.incr_epochs,
     )
     if args.out_dir is None:
-        args.out_dir = os.path.join("result_continual", args.model, sub, run_tag)
+        args.out_dir = os.path.join(
+            "result_continual", args.model, sub, ut.run_stamp_mmddhhmm() + "_" + run_tag
+        )
 
     loss_idx = cst.LOSSES.index(args.loss)
     n_input = cst.FEATURE_SIZE[cst.TECH_NAMES.index(tech)]
@@ -240,7 +244,6 @@ def main():
 
     out_root = args.out_dir
     os.makedirs(out_root, exist_ok=True)
-    rank_summary_lines = []
 
     tf.reset_default_graph()
     if args.model == "mlp":
@@ -295,8 +298,6 @@ def main():
         txi, tyl, _, _, _ = cst.load_one_bug(args.data_root, tech, sub, v)
         pre = cst.eval_bug(sess, graph, txi, tyl)
         pre_before_incr[v] = pre
-        if pre is not None:
-            rank_summary_lines.append("PRE\t%d\t%s" % (v, " ".join(str(s) for s in pre["scores"])))
 
         ti, tl, tg, _, _ = cst.load_one_bug(args.data_root, tech, sub, v)
         _train_incremental_with_replay_agem(
@@ -337,27 +338,19 @@ def main():
         _, _, _, txi, tyl = cst.load_one_bug(args.data_root, tech, sub, v)
         ev = cst.eval_bug(sess, graph, txi, tyl)
         final_eval[v] = ev
-        if ev is not None:
-            rank_summary_lines.append("FINAL\t%d\t%s" % (v, " ".join(str(s) for s in ev["scores"])))
 
     seen = list(range(1, v_end + 1))
-
-    def _hit_topk(ev, k):
-        if ev is None or ev["min"] < 0:
-            return 0.0
-        return 1.0 if ev["min"] <= float(k) else 0.0
 
     final_top1_list = [final_eval[v]["top1"] for v in seen if final_eval[v] and final_eval[v]["min"] >= 0]
     final_top3_list = [final_eval[v]["top3"] for v in seen if final_eval[v] and final_eval[v]["min"] >= 0]
     final_top5_list = [final_eval[v]["top5"] for v in seen if final_eval[v] and final_eval[v]["min"] >= 0]
-    final_acc_top1_t = float(np.mean(final_top1_list)) if final_top1_list else 0.0
-    final_acc_top3_t = float(np.mean(final_top3_list)) if final_top3_list else 0.0
-    final_acc_top5_t = float(np.mean(final_top5_list)) if final_top5_list else 0.0
+    top1_count, top3_count, top5_count = ut.topk_hit_counts(
+        final_top1_list, final_top3_list, final_top5_list
+    )
 
-    seen_no_warmup = [v for v in seen if v > warmup]
-    incr_pre_acc_top1 = float(np.mean([_hit_topk(pre_before_incr.get(v), 1) for v in seen_no_warmup])) if seen_no_warmup else 0.0
-    incr_pre_acc_top3 = float(np.mean([_hit_topk(pre_before_incr.get(v), 3) for v in seen_no_warmup])) if seen_no_warmup else 0.0
-    incr_pre_acc_top5 = float(np.mean([_hit_topk(pre_before_incr.get(v), 5) for v in seen_no_warmup])) if seen_no_warmup else 0.0
+    incr_pre_top1_count, incr_pre_top3_count, incr_pre_top5_count, mfr, mar = ut.warmup_plus_pre_metrics(
+        seen, warmup, acc_right_after, pre_before_incr
+    )
 
     bwt_terms = []
     bwt_terms_top5 = []
@@ -371,7 +364,6 @@ def main():
     final_bwt_t = float(np.mean(bwt_terms)) if bwt_terms else 0.0
     final_bwt_t5 = float(np.mean(bwt_terms_top5)) if bwt_terms_top5 else 0.0
 
-    agg = ut.aggregate_official_style([final_eval[v] for v in seen])
     lines = [
         "subject=%s tech=%s model=%s loss=softmax" % (sub, tech, args.model),
         "warmup=%d training_epochs(warmup)=%d incr_epochs=%d v_end=%d" % (warmup, args.training_epochs, args.incr_epochs, v_end),
@@ -387,36 +379,19 @@ def main():
             float(args.ewc_lambda),
             float(args.ewc_gamma),
         ),
-        "final_acc_top1_t (mean over bugs with Test fault only): %.4f" % final_acc_top1_t,
-        "final_acc_top3_t (mean over bugs with Test fault only): %.4f" % final_acc_top3_t,
-        "final_acc_top5_t (mean over bugs with Test fault only): %.4f" % final_acc_top5_t,
-        "incr_pre_acc_top1 (v>warmup, PRE-before-train, denom=v_end-warmup, no-fault=0): %.4f" % incr_pre_acc_top1,
-        "incr_pre_acc_top3 (v>warmup, PRE-before-train, denom=v_end-warmup, no-fault=0): %.4f" % incr_pre_acc_top3,
-        "incr_pre_acc_top5 (v>warmup, PRE-before-train, denom=v_end-warmup, no-fault=0): %.4f" % incr_pre_acc_top5,
+        "top1_count=%d" % top1_count,
+        "top3_count=%d" % top3_count,
+        "top5_count=%d" % top5_count,
+        "incr_pre_top1_count=%d" % incr_pre_top1_count,
+        "incr_pre_top3_count=%d" % incr_pre_top3_count,
+        "incr_pre_top5_count=%d" % incr_pre_top5_count,
+        "mfr=%.2f" % mfr,
+        "mar=%.2f" % mar,
         "final_bwt_t (Top1, mean_v acc_final[v]-acc_after_v[v]): %.4f" % final_bwt_t,
         "final_bwt_t5 (Top5, mean_v acc_final[v]-acc_after_v[v]): %.4f" % final_bwt_t5,
     ]
-    if agg:
-        lines.append(
-            "final_top1/top3/top5/mfr/mar (final model, paper-style on all seen): %d %d %d %s %s"
-            % (agg[0], agg[1], agg[2], agg[3], agg[4])
-        )
 
-    rep = "\n".join(lines) + "\n"
-    with open(os.path.join(out_root, "continual_metrics.txt"), "w") as f:
-        f.write(rep)
-
-    sum_path = os.path.join(out_root, "rank_scores_all_one_line.txt")
-    header = (
-        "# subject=%s tech=%s model=%s\n"
-        "# 数据行：制表符分隔三列 — 类型、版本号 v、分数列（多个分数用空格分隔，与 DeepFL/%s/v/Test.csv 行序一致）\n"
-        "# PRE ：对 bug v，在「用 v 的 Train 做本步增量训练之前」的模型对 v 的 Test 的 fault 概率（softmax 第 0 维）。\n"
-        "# FINAL：流式全部结束后，最终模型对 v 的 Test 的同上。\n"
-        % (sub, tech, args.model, sub)
-    )
-    with open(sum_path, "w") as f:
-        f.write(header)
-        f.write("\n".join(rank_summary_lines) + "\n")
+    ut.write_continual_metrics(out_root, lines, elapsed_sec=time.time() - t0)
 
     sess.close()
 

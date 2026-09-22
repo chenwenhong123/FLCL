@@ -7,13 +7,15 @@ from __future__ import print_function
 同一 bug 下用于评估的另一批候选。训练只用 Train（与 main.py 各模型 run 一致），
 eval_bug / 写 rank 用 Test，不把 Test 标签用于反向传播。
 
-默认输出根目录：result_continual/<model>/<subject>/loss_<loss>_wup<warmup>_te<training_epochs>_incr<incr>_v<v_end>/
+默认输出根目录：result_continual/<model>/<subject>/<mmddHHMM>_<run_tag>/
+结果文件：<mmddHHMM>_continual_metrics.txt
 """
 
 import argparse
 import math
 import os
 import sys
+import time
 
 import numpy as np
 import tensorflow.compat.v1 as tf
@@ -570,6 +572,7 @@ def main():
         print("warmup 需满足 1 <= warmup < v_end", file=sys.stderr)
         sys.exit(1)
 
+    t0 = time.time()
     ut.apply_deepfl_env_from_args(args)
     import config as cfg  # noqa: F401 — 触发根据 DEEPFL_* 加载全局配置
 
@@ -585,8 +588,9 @@ def main():
     )
     if args.optimizer != "adam" or not args.use_l2:
         run_tag += "_%s_l2%d" % (args.optimizer, 1 if args.use_l2 else 0)
+    stamp = ut.run_stamp_mmddhhmm()
     if args.out_dir is None:
-        args.out_dir = os.path.join("result_continual", args.model, sub, run_tag)
+        args.out_dir = os.path.join("result_continual", args.model, sub, stamp + "_" + run_tag)
 
     loss_idx = LOSSES.index(args.loss)
     n_input = FEATURE_SIZE[TECH_NAMES.index(tech)]
@@ -594,7 +598,6 @@ def main():
 
     out_root = args.out_dir
     os.makedirs(out_root, exist_ok=True)
-    rank_summary_lines = []
 
     tf.reset_default_graph()
     if args.model == "mlp":
@@ -642,14 +645,9 @@ def main():
     pre_before_incr = {}
     for v in tqdm(range(warmup + 1, v_end + 1), desc="incremental"):
         txi, tyl, _, _, _ = load_one_bug(args.data_root, tech, sub, v)
-        # 用「尚未用本 bug 的 Train 做本步增量」的模型，对 v 的 Test 打分（仅写入汇总文件）
+        # 用「尚未用本 bug 的 Train 做本步增量」的模型，对 v 的 Test 打分
         pre = eval_bug(sess, graph, txi, tyl)
         pre_before_incr[v] = pre
-        if pre is not None:
-            rank_summary_lines.append(
-                "PRE\t%d\t%s"
-                % (v, " ".join(str(s) for s in pre["scores"]))
-            )
 
         ti, tl, tg, _, _ = load_one_bug(args.data_root, tech, sub, v)
         train_epochs(
@@ -678,48 +676,21 @@ def main():
         _, _, _, txi, tyl = load_one_bug(args.data_root, tech, sub, v)
         ev = eval_bug(sess, graph, txi, tyl)
         final_eval[v] = ev
-        if ev is not None:
-            rank_summary_lines.append(
-                "FINAL\t%d\t%s"
-                % (v, " ".join(str(s) for s in ev["scores"]))
-            )
 
     # counting_metrics
     # 每个 bug v：用与 rank_parser 一致的 1-based min_rank；Top1/3/5 命中 <=> min_rank<=1/3/5
     seen = list(range(1, v_end + 1))
 
-    def _hit_topk(ev, k):
-        """无 Test、无 fault 正例(min<0) 视为未命中 0（与「只对有效 bug 取均值」的 final_acc_top1_t 不同）。"""
-        if ev is None or ev["min"] < 0:
-            return 0.0
-        return 1.0 if ev["min"] <= float(k) else 0.0
-
     final_top1_list = [final_eval[v]["top1"] for v in seen if final_eval[v] and final_eval[v]["min"] >= 0]
     final_top3_list = [final_eval[v]["top3"] for v in seen if final_eval[v] and final_eval[v]["min"] >= 0]
     final_top5_list = [final_eval[v]["top5"] for v in seen if final_eval[v] and final_eval[v]["min"] >= 0]
-
-    # 仅对「Test 上至少有一个 fault 标注」的 bug 取均值（分母 < v_end 时会高于「全体 bug」均值）
-    final_acc_top1_t = float(np.mean(final_top1_list)) if final_top1_list else 0.0
-    final_acc_top3_t = float(np.mean(final_top3_list)) if final_top3_list else 0.0
-    final_acc_top5_t = float(np.mean(final_top5_list)) if final_top5_list else 0.0
-
-    # warmup 之后每个新 bug：先 PRE 评 v 的 Test、再训 v 的 Train；此处统计 PRE 的 Topk 命中率，
-    # 分母固定为 (v_end - warmup)，无 Test / 无 fault 正例计 0（例如流式到第 14 个增量 id 时累计为 hits/4）。
-    seen_no_warmup = [v for v in seen if v > warmup]
-    incr_pre_acc_top1 = (
-        float(np.mean([_hit_topk(pre_before_incr.get(v), 1) for v in seen_no_warmup]))
-        if seen_no_warmup
-        else 0.0
+    top1_count, top3_count, top5_count = ut.topk_hit_counts(
+        final_top1_list, final_top3_list, final_top5_list
     )
-    incr_pre_acc_top3 = (
-        float(np.mean([_hit_topk(pre_before_incr.get(v), 3) for v in seen_no_warmup]))
-        if seen_no_warmup
-        else 0.0
-    )
-    incr_pre_acc_top5 = (
-        float(np.mean([_hit_topk(pre_before_incr.get(v), 5) for v in seen_no_warmup]))
-        if seen_no_warmup
-        else 0.0
+
+    # incr_pre：warmup 合训后对 1..warmup 的命中 + 增量段 PRE 命中；MFR/MAR 用同一套评估。
+    incr_pre_top1_count, incr_pre_top3_count, incr_pre_top5_count, mfr, mar = ut.warmup_plus_pre_metrics(
+        seen, warmup, acc_right_after, pre_before_incr
     )
 
     bwt_terms = []
@@ -734,7 +705,6 @@ def main():
     final_bwt_t = float(np.mean(bwt_terms)) if bwt_terms else 0.0
     final_bwt_t5 = float(np.mean(bwt_terms_top5)) if bwt_terms_top5 else 0.0
 
-    agg = ut.aggregate_official_style([final_eval[v] for v in seen])
     lines = [
         "subject=%s tech=%s model=%s loss=softmax" % (sub, tech, args.model),
         "warmup=%d training_epochs(warmup)=%d incr_epochs=%d v_end=%d"
@@ -742,40 +712,19 @@ def main():
         "optimizer=%s use_l2=%s" % (args.optimizer, str(args.use_l2)),
         "use_ewc=%s ewc_lambda=%.3f ewc_gamma=%.3f"
         % (str(args.use_ewc), float(args.ewc_lambda), float(args.ewc_gamma)),
-        "final_acc_top1_t (mean over bugs with Test fault only): %.4f" % final_acc_top1_t,
-        "final_acc_top3_t (mean over bugs with Test fault only): %.4f" % final_acc_top3_t,
-        "final_acc_top5_t (mean over bugs with Test fault only): %.4f" % final_acc_top5_t,
-        "incr_pre_acc_top1 (v>warmup, PRE-before-train, denom=v_end-warmup, no-fault=0): %.4f"
-        % incr_pre_acc_top1,
-        "incr_pre_acc_top3 (v>warmup, PRE-before-train, denom=v_end-warmup, no-fault=0): %.4f"
-        % incr_pre_acc_top3,
-        "incr_pre_acc_top5 (v>warmup, PRE-before-train, denom=v_end-warmup, no-fault=0): %.4f"
-        % incr_pre_acc_top5,
+        "top1_count=%d" % top1_count,
+        "top3_count=%d" % top3_count,
+        "top5_count=%d" % top5_count,
+        "incr_pre_top1_count=%d" % incr_pre_top1_count,
+        "incr_pre_top3_count=%d" % incr_pre_top3_count,
+        "incr_pre_top5_count=%d" % incr_pre_top5_count,
+        "mfr=%.2f" % mfr,
+        "mar=%.2f" % mar,
         "final_bwt_t (Top1, mean_v acc_final[v]-acc_after_v[v]): %.4f" % final_bwt_t,
         "final_bwt_t5 (Top5, mean_v acc_final[v]-acc_after_v[v]): %.4f" % final_bwt_t5,
     ]
-    if agg:
-        lines.append(
-            "final_top1/top3/top5/mfr/mar (final model, paper-style on all seen): %d %d %d %s %s"
-            % (agg[0], agg[1], agg[2], agg[3], agg[4])
-        )
 
-    # result_saving
-    rep = "\n".join(lines) + "\n"
-    with open(os.path.join(out_root, "continual_metrics.txt"), "w") as f:
-        f.write(rep)
-
-    sum_path = os.path.join(out_root, "rank_scores_all_one_line.txt")
-    header = (
-        "# subject=%s tech=%s model=%s\n"
-        "# 数据行：制表符分隔三列 — 类型、版本号 v、分数列（多个分数用空格分隔，与 DeepFL/%s/v/Test.csv 行序一致）\n"
-        "# PRE ：对 bug v，在「用 v 的 Train 做本步增量训练之前」的模型对 v 的 Test 的 fault 概率（softmax 第 0 维）。\n"
-        "# FINAL：流式全部结束后，最终模型对 v 的 Test 的同上。\n"
-        % (sub, tech, args.model, sub)
-    )
-    with open(sum_path, "w") as f:
-        f.write(header)
-        f.write("\n".join(rank_summary_lines) + "\n")
+    ut.write_continual_metrics(out_root, lines, elapsed_sec=time.time() - t0)
 
     sess.close()
 

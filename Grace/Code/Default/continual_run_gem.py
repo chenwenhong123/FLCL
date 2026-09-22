@@ -4,6 +4,8 @@ import os
 import pickle
 import random
 import sys
+import time
+from datetime import datetime
 from typing import Dict, List
 
 import numpy as np
@@ -18,6 +20,7 @@ from continual_run_with_replay import (
     ScheduledOptim,
     _resolve_data_path,
     _result_dir,
+    _run_out_dir,
     build_one_id_dataset,
     calc_summary,
     get_batch_for_id,
@@ -177,6 +180,12 @@ def main():
     replay_beta = float(sys.argv[10]) if len(sys.argv) > 10 else 1.0
     distill_alpha = float(sys.argv[11]) if len(sys.argv) > 11 else 0.5
     temperature = float(sys.argv[12]) if len(sys.argv) > 12 else 2.0
+    run_t0 = time.perf_counter()
+    run_ts = datetime.now().strftime("%m%d%H%M")
+    run_id = (
+        f"gem_base{base_epochs}_inc{inc_epochs}_lr{lr}_bs{batch_size}_warm{warmup_ids}"
+        f"_rs{replay_size}_rps{replay_per_step}_rb{replay_beta}_da{distill_alpha}_ts{run_ts}"
+    )
 
     set_seed(seed)
     args = init_args(project, lr, seed, batch_size)
@@ -302,6 +311,10 @@ def main():
                 "top1": summary["top1"],
                 "top3": summary["top3"],
                 "top5": summary["top5"],
+                "top1_count": summary["top1_count"],
+                "top3_count": summary["top3_count"],
+                "top5_count": summary["top5_count"],
+                "n": summary["n"],
                 "mfr": summary["mfr"],
                 "mar": summary["mar"],
                 "current_rank": cur_rank,
@@ -315,11 +328,8 @@ def main():
         seen_count += 1
         reservoir_update(replay_buffer_ids, seen_count, t, replay_size)
 
-    out_dir = _result_dir(project)
-    csv_path = os.path.join(
-        out_dir,
-        f"{project}_continual_with_replay_gem_metrics_base{base_epochs}_inc{inc_epochs}_lr{lr}_bs{batch_size}_warm{warmup_ids}.csv",
-    )
+    out_dir = _run_out_dir(project, run_id)
+    csv_path = os.path.join(out_dir, "metrics.csv")
     with open(csv_path, "w", newline="") as f:
         writer = csv.DictWriter(
             f,
@@ -332,6 +342,10 @@ def main():
                 "top1",
                 "top3",
                 "top5",
+                "top1_count",
+                "top3_count",
+                "top5_count",
+                "n",
                 "mfr",
                 "mar",
                 "current_rank",
@@ -341,19 +355,15 @@ def main():
         writer.writeheader()
         writer.writerows(rows)
 
-    model_path = os.path.join(
-        out_dir,
-        f"{project}_continual_with_replay_gem_model_base{base_epochs}_inc{inc_epochs}_lr{lr}_bs{batch_size}_warm{warmup_ids}.pt",
-    )
+    model_path = os.path.join(out_dir, "model.pt")
     torch.save(model.state_dict(), model_path)
 
-    summary_path = os.path.join(
-        out_dir,
-        f"{project}_continual_with_replay_gem_summary_base{base_epochs}_inc{inc_epochs}_lr{lr}_bs{batch_size}_warm{warmup_ids}.txt",
-    )
+    runtime_seconds = time.perf_counter() - run_t0
+    summary_path = os.path.join(out_dir, "summary.txt")
     last = rows[-1] if len(rows) > 0 else {}
     with open(summary_path, "w") as f:
         f.write(f"project: {project}\n")
+        f.write(f"run_id: {run_id}\n")
         f.write(f"device: {DEVICE}\n")
         f.write(f"warmup_ids: {warmup_ids}\n")
         f.write(f"base_epochs: {base_epochs}\n")
@@ -364,6 +374,7 @@ def main():
         f.write(f"distill_alpha: {distill_alpha}\n")
         f.write(f"temperature: {temperature}\n")
         f.write(f"selected_base_id: {best_base}\n")
+        f.write(f"runtime_seconds: {runtime_seconds:.3f}\n")
         if last:
             f.write(f"final_online_top1_t: {last['online_top1_t']:.6f}\n")
             f.write(f"final_acc_top1_t: {last['acc_top1_t']:.6f}\n")
@@ -372,6 +383,10 @@ def main():
             f.write(f"final_top1: {last['top1']:.6f}\n")
             f.write(f"final_top3: {last['top3']:.6f}\n")
             f.write(f"final_top5: {last['top5']:.6f}\n")
+            f.write(f"final_top1_count: {int(last['top1_count'])}\n")
+            f.write(f"final_top3_count: {int(last['top3_count'])}\n")
+            f.write(f"final_top5_count: {int(last['top5_count'])}\n")
+            f.write(f"final_n: {int(last['n'])}\n")
             f.write(f"final_mfr: {last['mfr']:.6f}\n")
             f.write(f"final_mar: {last['mar']:.6f}\n")
 

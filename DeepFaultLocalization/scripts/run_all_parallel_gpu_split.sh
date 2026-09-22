@@ -28,10 +28,7 @@ SCRIPTS_GPU0=(
 )
 
 SCRIPTS_GPU1=(
-  "scripts/run_05_mask_fullstack.sh"
-  "scripts/run_06_dropout_fullstack.sh"
-  "scripts/run_07_main_pretrain_fullstack.sh"
-  "scripts/run_08_main_pretrain_cross_project.sh"
+  "scripts/run_09_replay_der_local_grid.sh"
   "scripts/run_main_opt_l2_ablation.sh"
 )
 

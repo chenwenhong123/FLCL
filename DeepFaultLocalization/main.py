@@ -43,8 +43,16 @@ def main():
         mlp_dfl_2.run(train_path,train_label_path, test_path,test_label_path, group_path ,susp_path, l, featureNum=feature,nodeNum=feature)
         #mlp2.run(train_path,train_label_path, test_path,test_label_path, group_path ,susp_path, l, featureNum=feature,nodeNum=feature)
     end_time = time.time()
-        
-    #print("--- %s %s %s time: %s seconds ---" % (model, tech, losses[l], (end_time - start_time)))
+    elapsed = end_time - start_time
+    sec = max(0.0, float(elapsed))
+    h = int(sec // 3600)
+    m = int((sec % 3600) // 60)
+    s = sec - h * 3600 - m * 60
+    hms = "%dh%02dm%06.3fs" % (h, m, s)
+    rt_path = os.path.join(susp_dir, model + "-" + losses[l] + "-runtime.txt")
+    with open(rt_path, "w") as rf:
+        rf.write("runtime_sec=%.3f\nruntime=%s\n" % (sec, hms))
+    print("runtime_sec=%.3f runtime=%s" % (sec, hms))
 #main function execution
 if __name__=='__main__':
     main()

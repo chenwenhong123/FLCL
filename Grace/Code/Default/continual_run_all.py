@@ -4,11 +4,12 @@ import os
 import pickle
 import random
 import sys
+import time
+from datetime import datetime
 from typing import Dict, List
 
 import numpy as np
 import torch
-import torch.nn as nn
 import torch.nn.functional as F
 from torch import optim
 from tqdm import tqdm
@@ -19,29 +20,16 @@ from continual_run_with_replay import (
     ScheduledOptim,
     _resolve_data_path,
     _result_dir,
+    _run_out_dir,
     build_one_id_dataset,
     calc_summary,
     get_batch_for_id,
     get_device,
     init_args,
-    rank_metrics_from_batch,  # kept for compatibility, not used directly here
+    rank_metrics_from_batch,
     reservoir_update,
     set_seed,
 )
-
-
-class TaskGate(nn.Module):
-    """Task-wise gating mask: one gate vector per task id."""
-
-    def __init__(self, num_tasks: int, hidden_size: int):
-        super().__init__()
-        self.task_embed = nn.Embedding(num_tasks, hidden_size)
-        nn.init.zeros_(self.task_embed.weight)
-
-    def gate(self, task_id: int, batch_size: int, device: torch.device):
-        tid = torch.full((batch_size,), int(task_id), dtype=torch.long, device=device)
-        g = torch.sigmoid(self.task_embed(tid))  # [B, H]
-        return g
 
 
 def _method_kl_div(new_pre, old_pre, node_ids, temperature: float = 2.0):
@@ -55,53 +43,8 @@ def _method_kl_div(new_pre, old_pre, node_ids, temperature: float = 2.0):
     return F.kl_div(new_log_prob, old_prob, reduction="batchmean") * (temperature ** 2)
 
 
-def forward_with_task_mask(model: NlEncoder, gate_net: TaskGate, batch, task_id: int):
-    """
-    Recompute localization scores with task gate on top of encoder features.
-    This changes model framework while keeping original backbone intact.
-    """
-    _, _, x = model(batch[0], batch[1], batch[2], batch[3], batch[4], batch[5], batch[6], batch[7])
-    g = gate_net.gate(task_id, x.size(0), x.device).unsqueeze(1)  # [B, 1, H]
-    x_masked = x * g
-    resmask = torch.eq(batch[0], 2)
-    pre = F.softmax(model.resLinear2(x_masked).squeeze(-1).masked_fill(resmask == 0, -1e9), dim=-1)
-    loss = -torch.log(pre.clamp(min=1e-10, max=1.0)) * batch[3]
-    loss = loss.sum(dim=-1)
-    return loss, pre, x_masked
-
-
-def rank_metrics_from_batch_masked(model: NlEncoder, gate_net: TaskGate, batch, ans_list: List[int], task_id: int):
-    model.eval()
-    gate_net.eval()
-    with torch.no_grad():
-        _, pre, _ = forward_with_task_mask(model, gate_net, batch, task_id)
-        resmask = torch.eq(batch[0], 2)
-        s = -pre
-        s = s.masked_fill(resmask == 0, 1e9)
-        pred = s.argsort(dim=-1)
-        pred = pred.data.cpu().numpy()
-        pred_list = pred[0].tolist()[: resmask.sum(dim=-1)[0].item()]
-        ranks = [pred_list.index(x) for x in ans_list]
-        min_rank = min(ranks)
-        mar = float(np.mean(ranks))
-    return min_rank, mar
-
-
-def _trainable_params(model: NlEncoder, gate_net: TaskGate):
-    params = [p for p in model.parameters() if p.requires_grad]
-    params.extend([p for p in gate_net.parameters() if p.requires_grad])
-    return params
-
-
-def _named_trainable_params(model: NlEncoder, gate_net: TaskGate):
-    items = []
-    for n, p in model.named_parameters():
-        if p.requires_grad:
-            items.append(("model." + n, p))
-    for n, p in gate_net.named_parameters():
-        if p.requires_grad:
-            items.append(("gate." + n, p))
-    return items
+def _trainable_params(model: NlEncoder):
+    return [p for p in model.parameters() if p.requires_grad]
 
 
 def _grads_to_vector(params):
@@ -122,35 +65,37 @@ def _vector_to_grads(vec, params):
         offset += numel
 
 
-def clone_trainable_params(model: NlEncoder, gate_net: TaskGate) -> Dict[str, torch.Tensor]:
+def clone_trainable_params(model: NlEncoder) -> Dict[str, torch.Tensor]:
     out = {}
-    for n, p in _named_trainable_params(model, gate_net):
-        out[n] = p.detach().clone()
+    for n, p in model.named_parameters():
+        if p.requires_grad:
+            out[n] = p.detach().clone()
     return out
 
 
-def init_fisher(model: NlEncoder, gate_net: TaskGate) -> Dict[str, torch.Tensor]:
+def init_fisher(model: NlEncoder) -> Dict[str, torch.Tensor]:
     out = {}
-    for n, p in _named_trainable_params(model, gate_net):
-        out[n] = torch.zeros_like(p, device=p.device)
+    for n, p in model.named_parameters():
+        if p.requires_grad:
+            out[n] = torch.zeros_like(p, device=p.device)
     return out
 
 
 def compute_ewc_penalty(
     model: NlEncoder,
-    gate_net: TaskGate,
     prev_params: Dict[str, torch.Tensor],
     fisher: Dict[str, torch.Tensor],
 ):
     penalty = torch.tensor(0.0, device=next(model.parameters()).device)
-    for n, p in _named_trainable_params(model, gate_net):
+    for n, p in model.named_parameters():
+        if not p.requires_grad:
+            continue
         penalty = penalty + (fisher[n] * (p - prev_params[n]).pow(2)).sum()
     return penalty
 
 
 def estimate_fisher_from_ids(
     model: NlEncoder,
-    gate_net: TaskGate,
     args,
     project: str,
     sample_ids: List[int],
@@ -158,29 +103,26 @@ def estimate_fisher_from_ids(
     batch_cache,
     cache_on_device: bool,
 ):
-    fisher_new = init_fisher(model, gate_net)
+    fisher_new = init_fisher(model)
     if len(sample_ids) == 0:
         return fisher_new
     model.train()
-    gate_net.train()
     for sid in sample_ids:
         batch = get_batch_for_id(args, project, sid, ds_cache, batch_cache, cache_on_device)
         model.zero_grad(set_to_none=True)
-        gate_net.zero_grad(set_to_none=True)
-        loss, _, _ = forward_with_task_mask(model, gate_net, batch, sid)
+        loss, _, _ = model(batch[0], batch[1], batch[2], batch[3], batch[4], batch[5], batch[6], batch[7])
         loss = loss.mean()
         loss.backward()
-        for n, p in _named_trainable_params(model, gate_net):
-            if p.grad is not None:
+        for n, p in model.named_parameters():
+            if p.requires_grad and p.grad is not None:
                 fisher_new[n] += p.grad.detach().pow(2)
     for n in fisher_new:
         fisher_new[n] = fisher_new[n] / float(len(sample_ids))
     return fisher_new
 
 
-def train_incremental_with_mask(
+def train_incremental_with_all(
     model: NlEncoder,
-    gate_net: TaskGate,
     optimizer: ScheduledOptim,
     args,
     project: str,
@@ -191,8 +133,6 @@ def train_incremental_with_mask(
     replay_beta: float,
     distill_alpha: float,
     temperature: float,
-    use_ewc: bool,
-    use_gem: bool,
     prev_params: Dict[str, torch.Tensor],
     fisher: Dict[str, torch.Tensor],
     ewc_lambda: float,
@@ -200,25 +140,31 @@ def train_incremental_with_mask(
     batch_cache,
     cache_on_device: bool,
 ):
+    """
+    Replay + DER++ + EWC + A-GEM:
+    - g_cur 来自 current supervised + EWC
+    - g_ref 来自 replay supervised + replay distill
+    - 若冲突则用 A-GEM 投影 g_cur
+    """
     model.train()
-    gate_net.train()
-    params = _trainable_params(model, gate_net)
+    params = _trainable_params(model)
     old_model = copy.deepcopy(model).to(DEVICE).eval()
-    old_gate = copy.deepcopy(gate_net).to(DEVICE).eval()
 
     for _ in range(inc_epochs):
-        # current branch (+ optional EWC)
+        # current side (add EWC here)
         cur_batch = get_batch_for_id(args, project, cur_id, ds_cache, batch_cache, cache_on_device)
-        cur_loss, _, _ = forward_with_task_mask(model, gate_net, cur_batch, cur_id)
+        cur_loss, _, _ = model(
+            cur_batch[0], cur_batch[1], cur_batch[2], cur_batch[3], cur_batch[4], cur_batch[5], cur_batch[6], cur_batch[7]
+        )
         total_cur = cur_loss.mean()
-        if use_ewc and ewc_lambda > 0:
-            total_cur = total_cur + ewc_lambda * compute_ewc_penalty(model, gate_net, prev_params, fisher)
+        if ewc_lambda > 0:
+            total_cur = total_cur + ewc_lambda * compute_ewc_penalty(model, prev_params, fisher)
 
         optimizer.zero_grad()
         total_cur.backward()
         g_cur = _grads_to_vector(params)
 
-        # replay reference branch (DER++)
+        # replay reference side
         use_replay = min(replay_per_step, len(replay_ids))
         if use_replay > 0:
             picked = random.sample(replay_ids, use_replay)
@@ -226,10 +172,28 @@ def train_incremental_with_mask(
             rep_kls = []
             for rid in picked:
                 rep_batch = get_batch_for_id(args, project, rid, ds_cache, batch_cache, cache_on_device)
-                rep_loss, rep_pre, _ = forward_with_task_mask(model, gate_net, rep_batch, rid)
+                rep_loss, rep_pre, _ = model(
+                    rep_batch[0],
+                    rep_batch[1],
+                    rep_batch[2],
+                    rep_batch[3],
+                    rep_batch[4],
+                    rep_batch[5],
+                    rep_batch[6],
+                    rep_batch[7],
+                )
                 rep_sup_losses.append(rep_loss.mean())
                 with torch.no_grad():
-                    _, old_pre, _ = forward_with_task_mask(old_model, old_gate, rep_batch, rid)
+                    _, old_pre, _ = old_model(
+                        rep_batch[0],
+                        rep_batch[1],
+                        rep_batch[2],
+                        rep_batch[3],
+                        rep_batch[4],
+                        rep_batch[5],
+                        rep_batch[6],
+                        rep_batch[7],
+                    )
                 rep_kls.append(_method_kl_div(rep_pre, old_pre, rep_batch[0], temperature))
 
             rep_sup = torch.stack(rep_sup_losses).mean()
@@ -239,11 +203,7 @@ def train_incremental_with_mask(
             optimizer.zero_grad()
             ref_loss.backward()
             g_ref = _grads_to_vector(params)
-        else:
-            g_ref = None
 
-        # optional A-GEM projection
-        if use_gem and g_ref is not None:
             dot = torch.dot(g_cur, g_ref)
             if dot < 0:
                 ref_norm_sq = torch.dot(g_ref, g_ref).clamp(min=1e-12)
@@ -261,10 +221,10 @@ def train_incremental_with_mask(
 def main():
     if len(sys.argv) < 5:
         print(
-            "Usage: python continual_run_mask.py <Project> <lr> <seed> <batch_size> "
+            "Usage: python continual_run_all.py <Project> <lr> <seed> <batch_size> "
             "[warmup_ids=10] [base_epochs=15] [inc_epochs=2] "
             "[replay_size=20] [replay_per_step=2] [replay_beta=1.0] [distill_alpha=0.5] [temperature=2.0] "
-            "[ewc_lambda=10.0] [ewc_gamma=0.9] [fisher_ids=4] [use_ewc=1] [use_gem=1]"
+            "[ewc_lambda=10.0] [ewc_gamma=0.9] [fisher_ids=4]"
         )
         sys.exit(1)
 
@@ -283,12 +243,18 @@ def main():
     ewc_lambda = float(sys.argv[13]) if len(sys.argv) > 13 else 10.0
     ewc_gamma = float(sys.argv[14]) if len(sys.argv) > 14 else 0.9
     fisher_ids = int(sys.argv[15]) if len(sys.argv) > 15 else 4
-    use_ewc = int(sys.argv[16]) if len(sys.argv) > 16 else 1
-    use_gem = int(sys.argv[17]) if len(sys.argv) > 17 else 1
+    run_t0 = time.perf_counter()
+    run_ts = datetime.now().strftime("%m%d%H%M")
+    run_id = (
+        f"all_base{base_epochs}_inc{inc_epochs}_lr{lr}_bs{batch_size}_warm{warmup_ids}"
+        f"_rs{replay_size}_rps{replay_per_step}_rb{replay_beta}_da{distill_alpha}"
+        f"_el{ewc_lambda}_eg{ewc_gamma}_fid{fisher_ids}_ts{run_ts}"
+    )
 
     set_seed(seed)
     args = init_args(project, lr, seed, batch_size)
     print(f"using device: {get_device()}")
+
     cache_on_device = DEVICE.type == "cuda" and (args.NlLen + args.CodeLen) <= 1200
     ds_cache = {}
     batch_cache = {}
@@ -304,30 +270,23 @@ def main():
 
     best_base = None
     best_state = None
-    best_gate_state = None
     best_score = (-1, -1, float("inf"))
 
-    # warmup: pick best base model + gate
     for bid in tqdm(warmup_range, desc="Warmup Base Selection", ncols=100):
         set_seed(seed + bid)
         ds = build_one_id_dataset(args, project, bid)
         ds_cache[bid] = ds
         model = NlEncoder(args).to(DEVICE)
-        gate_net = TaskGate(total_ids, args.embedding_size).to(DEVICE)
-        optimizer = ScheduledOptim(
-            optim.Adam(list(model.parameters()) + list(gate_net.parameters()), lr=args.lr),
-            args.embedding_size,
-            4000,
-        )
+        optimizer = ScheduledOptim(optim.Adam(model.parameters(), lr=args.lr), args.embedding_size, 4000)
         for _ in range(base_epochs):
             batch = get_batch_for_id(args, project, bid, ds_cache, batch_cache, cache_on_device)
-            loss, _, _ = forward_with_task_mask(model, gate_net, batch, bid)
+            loss, _, _ = model(batch[0], batch[1], batch[2], batch[3], batch[4], batch[5], batch[6], batch[7])
             optimizer.zero_grad()
             loss = loss.mean()
             loss.backward()
             optimizer.step_and_update_lr()
         batch = get_batch_for_id(args, project, bid, ds_cache, batch_cache, cache_on_device)
-        rank, _ = rank_metrics_from_batch_masked(model, gate_net, batch, data[bid]["ans"], bid)
+        rank, _ = rank_metrics_from_batch(model, batch, data[bid]["ans"])
         top1 = 1 if rank == 0 else 0
         top3 = 1 if rank < 3 else 0
         mfr = float(rank)
@@ -335,41 +294,33 @@ def main():
         if score > (best_score[0], best_score[1], -best_score[2]):
             best_score = (top1, top3, mfr)
             best_state = copy.deepcopy(model.state_dict())
-            best_gate_state = copy.deepcopy(gate_net.state_dict())
             best_base = bid
 
-    if best_state is None or best_gate_state is None:
+    if best_state is None:
         raise RuntimeError("Failed to choose a base model from warmup ids.")
 
     model = NlEncoder(args).to(DEVICE)
-    gate_net = TaskGate(total_ids, args.embedding_size).to(DEVICE)
     model.load_state_dict(best_state)
-    gate_net.load_state_dict(best_gate_state)
-    optimizer = ScheduledOptim(
-        optim.Adam(list(model.parameters()) + list(gate_net.parameters()), lr=args.lr),
-        args.embedding_size,
-        4000,
-    )
+    optimizer = ScheduledOptim(optim.Adam(model.parameters(), lr=args.lr), args.embedding_size, 4000)
 
     first_learn_top1: Dict[int, float] = {}
     first_learn_top3: Dict[int, float] = {}
     replay_buffer_ids: List[int] = list(warmup_range[: max(0, replay_size)])
     seen_count = warmup_ids - 1
 
-    prev_params = clone_trainable_params(model, gate_net)
-    fisher = init_fisher(model, gate_net)
+    prev_params = clone_trainable_params(model)
+    fisher = init_fisher(model)
 
     for bid in warmup_range:
         batch = get_batch_for_id(args, project, bid, ds_cache, batch_cache, cache_on_device)
-        rank, _ = rank_metrics_from_batch_masked(model, gate_net, batch, data[bid]["ans"], bid)
+        rank, _ = rank_metrics_from_batch(model, batch, data[bid]["ans"])
         first_learn_top1[bid] = 1.0 if rank == 0 else 0.0
         first_learn_top3[bid] = 1.0 if rank < 3 else 0.0
 
     rows = []
-    for t in tqdm(stream_range, desc="Incremental Stream (Mask+Replay+DER++)", ncols=100):
-        train_incremental_with_mask(
+    for t in tqdm(stream_range, desc="Incremental Stream (Replay+DER+++A-GEM+EWC)", ncols=100):
+        train_incremental_with_all(
             model=model,
-            gate_net=gate_net,
             optimizer=optimizer,
             args=args,
             project=project,
@@ -380,8 +331,6 @@ def main():
             replay_beta=replay_beta,
             distill_alpha=distill_alpha,
             temperature=temperature,
-            use_ewc=bool(use_ewc),
-            use_gem=bool(use_gem),
             prev_params=prev_params,
             fisher=fisher,
             ewc_lambda=ewc_lambda,
@@ -391,7 +340,7 @@ def main():
         )
 
         cur_batch = get_batch_for_id(args, project, t, ds_cache, batch_cache, cache_on_device)
-        cur_rank, cur_mar = rank_metrics_from_batch_masked(model, gate_net, cur_batch, data[t]["ans"], t)
+        cur_rank, cur_mar = rank_metrics_from_batch(model, cur_batch, data[t]["ans"])
         online_top1 = 1.0 if cur_rank == 0 else 0.0
         first_learn_top1[t] = online_top1
         first_learn_top3[t] = 1.0 if cur_rank < 3 else 0.0
@@ -403,7 +352,7 @@ def main():
         seen_top3 = []
         for sid in seen_ids:
             batch = get_batch_for_id(args, project, sid, ds_cache, batch_cache, cache_on_device)
-            r, m = rank_metrics_from_batch_masked(model, gate_net, batch, data[sid]["ans"], sid)
+            r, m = rank_metrics_from_batch(model, batch, data[sid]["ans"])
             seen_ranks.append(r)
             seen_mars.append(m)
             seen_top1.append(1.0 if r == 0 else 0.0)
@@ -429,6 +378,10 @@ def main():
                 "top1": summary["top1"],
                 "top3": summary["top3"],
                 "top5": summary["top5"],
+                "top1_count": summary["top1_count"],
+                "top3_count": summary["top3_count"],
+                "top5_count": summary["top5_count"],
+                "n": summary["n"],
                 "mfr": summary["mfr"],
                 "mar": summary["mar"],
                 "current_rank": cur_rank,
@@ -442,23 +395,19 @@ def main():
         seen_count += 1
         reservoir_update(replay_buffer_ids, seen_count, t, replay_size)
 
-        if bool(use_ewc):
-            fisher_sample_ids = [t]
-            if len(replay_buffer_ids) > 0 and fisher_ids > 1:
-                k = min(fisher_ids - 1, len(replay_buffer_ids))
-                fisher_sample_ids += random.sample(replay_buffer_ids, k)
-            fisher_new = estimate_fisher_from_ids(
-                model, gate_net, args, project, fisher_sample_ids, ds_cache, batch_cache, cache_on_device
-            )
-            for n in fisher:
-                fisher[n] = ewc_gamma * fisher[n] + (1.0 - ewc_gamma) * fisher_new[n]
-            prev_params = clone_trainable_params(model, gate_net)
+        fisher_sample_ids = [t]
+        if len(replay_buffer_ids) > 0 and fisher_ids > 1:
+            k = min(fisher_ids - 1, len(replay_buffer_ids))
+            fisher_sample_ids += random.sample(replay_buffer_ids, k)
+        fisher_new = estimate_fisher_from_ids(
+            model, args, project, fisher_sample_ids, ds_cache, batch_cache, cache_on_device
+        )
+        for n in fisher:
+            fisher[n] = ewc_gamma * fisher[n] + (1.0 - ewc_gamma) * fisher_new[n]
+        prev_params = clone_trainable_params(model)
 
-    out_dir = _result_dir(project)
-    csv_path = os.path.join(
-        out_dir,
-        f"{project}_continual_mask_metrics_use_ewc{use_ewc}_use_gem{use_gem}_base{base_epochs}_inc{inc_epochs}_lr{lr}_bs{batch_size}_warm{warmup_ids}.csv",
-    )
+    out_dir = _run_out_dir(project, run_id)
+    csv_path = os.path.join(out_dir, "metrics.csv")
     with open(csv_path, "w", newline="") as f:
         writer = csv.DictWriter(
             f,
@@ -471,6 +420,10 @@ def main():
                 "top1",
                 "top3",
                 "top5",
+                "top1_count",
+                "top3_count",
+                "top5_count",
+                "n",
                 "mfr",
                 "mar",
                 "current_rank",
@@ -480,19 +433,15 @@ def main():
         writer.writeheader()
         writer.writerows(rows)
 
-    model_path = os.path.join(
-        out_dir,
-        f"{project}_continual_mask_model_use_ewc{use_ewc}_use_gem{use_gem}_base{base_epochs}_inc{inc_epochs}_lr{lr}_bs{batch_size}_warm{warmup_ids}.pt",
-    )
-    torch.save({"model": model.state_dict(), "gate": gate_net.state_dict()}, model_path)
+    model_path = os.path.join(out_dir, "model.pt")
+    torch.save(model.state_dict(), model_path)
 
-    summary_path = os.path.join(
-        out_dir,
-        f"{project}_continual_mask_summary_use_ewc{use_ewc}_use_gem{use_gem}_base{base_epochs}_inc{inc_epochs}_lr{lr}_bs{batch_size}_warm{warmup_ids}.txt",
-    )
+    runtime_seconds = time.perf_counter() - run_t0
+    summary_path = os.path.join(out_dir, "summary.txt")
     last = rows[-1] if len(rows) > 0 else {}
     with open(summary_path, "w") as f:
         f.write(f"project: {project}\n")
+        f.write(f"run_id: {run_id}\n")
         f.write(f"device: {DEVICE}\n")
         f.write(f"warmup_ids: {warmup_ids}\n")
         f.write(f"base_epochs: {base_epochs}\n")
@@ -502,12 +451,11 @@ def main():
         f.write(f"replay_beta: {replay_beta}\n")
         f.write(f"distill_alpha: {distill_alpha}\n")
         f.write(f"temperature: {temperature}\n")
-        f.write(f"use_ewc: {use_ewc}\n")
-        f.write(f"use_gem: {use_gem}\n")
         f.write(f"ewc_lambda: {ewc_lambda}\n")
         f.write(f"ewc_gamma: {ewc_gamma}\n")
         f.write(f"fisher_ids: {fisher_ids}\n")
         f.write(f"selected_base_id: {best_base}\n")
+        f.write(f"runtime_seconds: {runtime_seconds:.3f}\n")
         if last:
             f.write(f"final_online_top1_t: {last['online_top1_t']:.6f}\n")
             f.write(f"final_acc_top1_t: {last['acc_top1_t']:.6f}\n")
@@ -516,6 +464,10 @@ def main():
             f.write(f"final_top1: {last['top1']:.6f}\n")
             f.write(f"final_top3: {last['top3']:.6f}\n")
             f.write(f"final_top5: {last['top5']:.6f}\n")
+            f.write(f"final_top1_count: {int(last['top1_count'])}\n")
+            f.write(f"final_top3_count: {int(last['top3_count'])}\n")
+            f.write(f"final_top5_count: {int(last['top5_count'])}\n")
+            f.write(f"final_n: {int(last['n'])}\n")
             f.write(f"final_mfr: {last['mfr']:.6f}\n")
             f.write(f"final_mar: {last['mar']:.6f}\n")
 

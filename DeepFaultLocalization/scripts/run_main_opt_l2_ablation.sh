@@ -3,7 +3,7 @@
 # 1) sgd + 无 L2   2) adam + 无 L2   3) sgd + L2   4) adam + L2
 #
 # 输出根：result_stream_opt_l2_ablation/<setting>/<model>/<subject>/
-# 每组 run 的指标见 continual_metrics.txt；流式分数摘要见 rank_scores_all_one_line.txt。
+# 每组 run 的指标见 {mmddHHMM}_continual_metrics.txt。
 # 注意：rank_parser 依赖 main 式路径 <out>/<sub>/<v>/<tech>/<model>-<loss>-<epoch>，与流式目录不兼容，此处不调用。
 
 set -euo pipefail

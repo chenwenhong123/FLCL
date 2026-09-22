@@ -1,6 +1,10 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+CODE_DIR="$(cd "${SCRIPT_DIR}/.." && pwd)"
+cd "${CODE_DIR}"
+
 # 局部网格搜索（主配置固定，全项目）：
 # 1) Replay + EWC （continual_run_ewc.py）
 # 2) Replay + GEM （continual_run_gem.py）
@@ -11,9 +15,9 @@ set -euo pipefail
 # - 默认采用你当前主配置：lr=0.01, seed=0, bs=60, warm=10, base=15, inc=2
 #
 # 用法示例：
-#   bash run_local_grid_replay_ewc_gem.sh
-#   LR=0.005 PROJECTS="Lang Closure" bash run_local_grid_replay_ewc_gem.sh
-#   AVG_MIN_PER_RUN=8 bash run_local_grid_replay_ewc_gem.sh
+#   bash scripts/run_local_grid_replay_ewc_gem.sh
+#   LR=0.005 PROJECTS="Lang Closure" bash scripts/run_local_grid_replay_ewc_gem.sh
+#   AVG_MIN_PER_RUN=8 bash scripts/run_local_grid_replay_ewc_gem.sh
 
 # ------------------------
 # 主配置（可调）
@@ -84,6 +88,7 @@ est_h=$((est_total_min / 60))
 est_m=$((est_total_min % 60))
 
 echo "==== Local Grid: Replay+EWC / Replay+GEM ===="
+echo "CODE_DIR=${CODE_DIR}"
 echo "PROJECTS=${PROJECTS}"
 echo "MainConfig: lr=${LR} seed=${SEED} bs=${BATCH_SIZE} warm=${WARMUP_IDS} base=${BASE_EPOCHS} inc=${INC_EPOCHS}"
 echo
@@ -117,13 +122,18 @@ run_ewc() {
     "${el}" "${EWC_GAMMA}" "${FISHER_IDS}" \
     | tee "logs/${tag}.log"
 
-  # 防覆盖归档：ewc.py原始输出文件名不含网格参数，需按tag复制
-  local out_dir="result/${p}"
-  local base_name="${p}_continual_with_replay_ewc"
-  local suffix="base${BASE_EPOCHS}_inc${INC_EPOCHS}_lr${LR}_bs${BATCH_SIZE}_warm${WARMUP_IDS}"
-  cp "${out_dir}/${base_name}_summary_${suffix}.txt" "grid_outputs/ewc/${tag}_summary.txt"
-  cp "${out_dir}/${base_name}_metrics_${suffix}.csv" "grid_outputs/ewc/${tag}_metrics.csv"
-  cp "${out_dir}/${base_name}_model_${suffix}.pt" "grid_outputs/ewc/${tag}_model.pt"
+  # 防覆盖归档：从当次运行目录拷贝短文件名输出
+  local src_summary
+  src_summary="$(awk -F': ' '/Saved summary:/{d=$2} END{print d}' "logs/${tag}.log")"
+  if [[ -z "${src_summary}" || ! -f "${src_summary}" ]]; then
+    echo "Error: cannot find summary for ${tag} from logs/${tag}.log"
+    exit 1
+  fi
+  local run_dir
+  run_dir="$(dirname "${src_summary}")"
+  cp "${src_summary}" "grid_outputs/ewc/${tag}_summary.txt"
+  cp "${run_dir}/metrics.csv" "grid_outputs/ewc/${tag}_metrics.csv"
+  cp "${run_dir}/model.pt" "grid_outputs/ewc/${tag}_model.pt"
 }
 
 run_gem() {
@@ -136,13 +146,18 @@ run_gem() {
     "${REPLAY_SIZE}" "${rps}" "${rb}" "${da}" "${TEMPERATURE}" \
     | tee "logs/${tag}.log"
 
-  # 防覆盖归档：gem.py原始输出文件名不含网格参数，需按tag复制
-  local out_dir="result/${p}"
-  local base_name="${p}_continual_with_replay_gem"
-  local suffix="base${BASE_EPOCHS}_inc${INC_EPOCHS}_lr${LR}_bs${BATCH_SIZE}_warm${WARMUP_IDS}"
-  cp "${out_dir}/${base_name}_summary_${suffix}.txt" "grid_outputs/gem/${tag}_summary.txt"
-  cp "${out_dir}/${base_name}_metrics_${suffix}.csv" "grid_outputs/gem/${tag}_metrics.csv"
-  cp "${out_dir}/${base_name}_model_${suffix}.pt" "grid_outputs/gem/${tag}_model.pt"
+  # 防覆盖归档：从当次运行目录拷贝短文件名输出
+  local src_summary
+  src_summary="$(awk -F': ' '/Saved summary:/{d=$2} END{print d}' "logs/${tag}.log")"
+  if [[ -z "${src_summary}" || ! -f "${src_summary}" ]]; then
+    echo "Error: cannot find summary for ${tag} from logs/${tag}.log"
+    exit 1
+  fi
+  local run_dir
+  run_dir="$(dirname "${src_summary}")"
+  cp "${src_summary}" "grid_outputs/gem/${tag}_summary.txt"
+  cp "${run_dir}/metrics.csv" "grid_outputs/gem/${tag}_metrics.csv"
+  cp "${run_dir}/model.pt" "grid_outputs/gem/${tag}_model.pt"
 }
 
 for p in ${PROJECTS}; do

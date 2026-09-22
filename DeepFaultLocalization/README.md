@@ -10,7 +10,7 @@ DeepFL 是一种基于深度学习的故障定位方法。本项目使用 [Tenso
 
 ## 数据集
 
-数据集可从网盘下载：[Mega 云盘](https://mega.nz/#F!7rhCwQzT!OXUlRaIh-kyevSr6sTdwxA)。共 7 个 `.gz` 压缩包，对应论文中的不同设置：
+数据集可从网盘下载：[Mega 云盘](https://mega.nz/#F!7rhCwQzT!OXUlRaIh-kyevSr6sTdwxA)。共 7 个 `.gz` 压缩包，对应DeepFL论文中的不同设置：
 
 | 文件名 | 说明 |
 |--------|------|
@@ -22,7 +22,7 @@ DeepFL 是一种基于深度学习的故障定位方法。本项目使用 [Tenso
 | `DeepFL-Metrics.tar.gz` | 三维：谱系、变异、文本相似度 |
 | `DeepFL-Textual.tar.gz` | 三维：谱系、变异、度量 |
 
-解压后将数据放到**自定义父目录**下，该路径将作为下文 `main.py` 与增量脚本的 `data_root` 使用。
+解压后将数据放到**自定义父目录**下，该路径将作为下文 `main.py` 与增量脚本的 `data_root` 使用（本文路径为DeepFaultLocalization/DeepFL）。
 
 ## 构建 DeepFL_CL 数据集（持续学习 / 流式专用）
 
@@ -99,7 +99,7 @@ python rank_parser.py <数据父目录绝对路径> <结果输出目录绝对路
 
 ## 增量学习与持续学习（流式）
 
-除传统 `main.py` 按版本独立训练外，本仓库提供**按缺陷顺序到达**的流式训练脚本：先对前 `warmup` 个缺陷合并做 warmup，再对每个新缺陷做增量更新，并输出 `continual_metrics.txt`、`rank_scores_all_one_line.txt` 等。
+除传统 `main.py` 按版本独立训练外，本仓库提供**按缺陷顺序到达**的流式训练脚本：先对前 `warmup` 个缺陷合并做 warmup，再对每个新缺陷做增量更新，并输出 `{mmddHHMM}_continual_metrics.txt`（文件名以月份日期小时分钟开头，文件内含 `runtime_sec` / `runtime` 运行时间、`top1_count` / `top3_count` / `top5_count` 命中个数及原有比例指标）。
 
 ### 数据与 `tech` 约定
 
@@ -155,32 +155,6 @@ python rank_parser.py <数据父目录绝对路径> <结果输出目录绝对路
 
 参数集与 `continual_replay.py` 相同（`--use_replay`、`--use_ewc`、回放容量、`replay_per_step`、`replay_beta`、`distill_alpha`、`temperature`、`ewc_lambda`、`ewc_gamma`）；增量步内使用 A-GEM 式梯度投影（实现见脚本内 `_train_incremental_with_replay_agem`）。
 
-### `continual_mask.py`（Replay + DER++ + 可选 EWC + 可选门控掩码）
-
-在 `continual_replay` 类参数基础上增加：
-
-| 参数 | 说明 | 默认 |
-|------|------|------|
-| `--use_gem` | 是否启用 A-GEM | `true` |
-| `--use_mask` | 是否启用门控掩码 | `true` |
-| `--mask_keep_ratio` | 每任务门控保留特征比例（主要用于 `mlp_dfl_1`） | `0.6` |
-| `--mask_ema` | 任务掩码 EMA 平滑系数 | `0.9` |
-
-**注意**：`continual_mask.py` 的位置参数 `model` 仅支持脚本内声明的子集（如 `mlp2`、`mlp_dfl_1`、`birnn`），请以 `--help` 为准。
-
-### `continual_dropout.py`（Replay + DER++ + 可选 EWC + GEM + 门控 Dropout）
-
-在回放 / 蒸馏 / EWC / GEM 之外增加：
-
-| 参数 | 说明 | 默认 |
-|------|------|------|
-| `--use_mask_dropout` | 是否启用门控 Dropout | `true` |
-| `--mask_keep_ratio` | 门控保留比例 | `0.6` |
-| `--mask_ema` | 掩码 EMA | `0.9` |
-| `--dropout_unmask_p` | 对未被 mask 保留部分的输入 Dropout 概率 | `0.3` |
-
-**注意**：`continual_dropout.py` 的 `model` 支持集合同样受限，请以脚本为准。
-
 ### 非 `main` 入口的全局配置（环境变量）
 
 `config.py` 在非 `main.py` 风格 argv 下会读取 `DEEPFL_*`。`utils.apply_deepfl_env_from_args` 会根据各脚本的 argparse 写入其中一部分；也可在启动前手动 `export`：
@@ -201,7 +175,6 @@ python rank_parser.py <数据父目录绝对路径> <结果输出目录绝对路
 
 ```bash
 bash scripts/run_09_replay_der_local_grid.sh
-# 仅打印计划：DRY_RUN=1 bash scripts/run_09_replay_der_local_grid.sh
 ```
 
 具体组合与输出目录见该脚本内注释及生成的 `result_grid_local_mlpdfl1/grid_plan.tsv`。

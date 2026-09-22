@@ -13,6 +13,8 @@ from nltk.translate.bleu_score import corpus_bleu
 import pandas as pd
 import random
 import sys
+import time
+from datetime import datetime
 # Prefer CWD, then fall back to Code/Default/GraceDate/
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 DEFAULT_DATA_DIR = os.path.join(BASE_DIR, "GraceDate")
@@ -128,7 +130,7 @@ def train(t = 5, p='Math'):
     each_epoch_pred = {}
     for x in dev_set.Nl_Voc:
       rdic[dev_set.Nl_Voc[x]] = x
-    for epoch in range(15):
+    for epoch in range(3):
         index = 0
         for dBatch in tqdm(train_set.Get_Train(args.batch_size)):
             if index == 0:
@@ -195,12 +197,54 @@ if __name__ == "__main__":
     np.set_printoptions(threshold=sys.maxsize)
     res = {}    
     p = sys.argv[2]
-    res[int(sys.argv[1])] = train(int(sys.argv[1]), p)
+    bug_id = int(sys.argv[1])
+    run_t0 = time.perf_counter()
+    res[bug_id] = train(bug_id, p)
+    runtime_seconds = time.perf_counter() - run_t0
+    run_ts = datetime.now().strftime("%m%d%H%M")
+    out_dir = _result_dir(p)
     out_path = os.path.join(
-        _result_dir(p),
-        '%sres%d_%d_%s_%s.pkl' % (p, int(sys.argv[1]), args.seed, args.lr, args.batch_size),
+        out_dir,
+        '%sres%d_%d_%s_%s.pkl' % (p, bug_id, args.seed, args.lr, args.batch_size),
     )
     open(out_path, 'wb').write(pickle.dumps(res))
+
+    print(f"runtime_seconds: {runtime_seconds:.3f}")
+    rt_path = out_path[:-4] + ".runtime.txt" if out_path.endswith(".pkl") else out_path + ".runtime.txt"
+    with open(rt_path, "w") as f:
+        f.write(f"{runtime_seconds:.3f}\n")
+
+    suffix = "_%d_%s_%s.runtime.txt" % (args.seed, args.lr, args.batch_size)
+    prefix = "%sres" % p
+    bug_times = []
+    for name in sorted(os.listdir(out_dir)):
+        if not (name.startswith(prefix) and name.endswith(suffix)):
+            continue
+        mid = name[len(prefix):-len(suffix)]
+        if not mid.isdigit():
+            continue
+        try:
+            with open(os.path.join(out_dir, name), "r") as f:
+                bug_times.append((int(mid), float(f.read().strip())))
+        except (OSError, ValueError):
+            continue
+    total_rt = sum(t for _, t in bug_times)
+    summary_path = os.path.join(
+        out_dir,
+        "oneshot_runtime_summary_%d_%s_%s.txt" % (args.seed, args.lr, args.batch_size),
+    )
+    with open(summary_path, "w") as f:
+        f.write("project: %s\n" % p)
+        f.write("seed: %s\n" % args.seed)
+        f.write("lr: %s\n" % args.lr)
+        f.write("batch_size: %s\n" % args.batch_size)
+        f.write("n_finished: %d\n" % len(bug_times))
+        f.write("runtime_seconds: %.3f\n" % total_rt)
+        f.write("runtime_hours: %.3f\n" % (total_rt / 3600.0))
+        for bid, t in bug_times:
+            f.write("bug_id_%d: %.3f\n" % (bid, t))
+    print(f"Saved runtime: {rt_path}")
+    print(f"Saved oneshot runtime summary: {summary_path}")
 
 
 

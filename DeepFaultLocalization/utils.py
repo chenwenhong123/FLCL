@@ -1,6 +1,7 @@
 from __future__ import print_function
 
 import os
+import time
 
 import numpy as np
 import tensorflow.compat.v1 as tf
@@ -114,6 +115,70 @@ def aggregate_official_style(per_bug_eval):
         return None
     ranks = ranks / n
     return int(tops[0]), int(tops[1]), int(tops[2]), round(float(ranks[0]), 2), round(float(ranks[1]), 2)
+
+
+def run_stamp_mmddhhmm():
+    """月份日期小时分钟，例如 09102351。"""
+    return time.strftime("%m%d%H%M")
+
+
+def topk_hit_counts(top1_list, top3_list, top5_list):
+    """有效 bug 上 Top-k 命中个数（与比例指标同一批样本）。"""
+    return (
+        int(sum(top1_list)) if top1_list else 0,
+        int(sum(top3_list)) if top3_list else 0,
+        int(sum(top5_list)) if top5_list else 0,
+    )
+
+
+def warmup_plus_pre_metrics(seen, warmup, acc_right_after, pre_before_incr):
+    """warmup 合训后对 1..warmup 的评估 + 增量段 PRE（训本 bug 之前）。
+
+    Top-k：无 Test / 无 fault 计 0。MFR/MAR：仅对 min>=0 取均值，两位小数。
+    """
+    c1 = c3 = c5 = 0
+    mins = []
+    avgs = []
+    for v in seen:
+        ev = acc_right_after.get(v) if v <= warmup else pre_before_incr.get(v)
+        if ev is None or ev["min"] < 0:
+            continue
+        mn = ev["min"]
+        if mn <= 1:
+            c1 += 1
+        if mn <= 3:
+            c3 += 1
+        if mn <= 5:
+            c5 += 1
+        mins.append(mn)
+        avgs.append(ev["avg"])
+    mfr = round(float(np.mean(mins)), 2) if mins else 0.0
+    mar = round(float(np.mean(avgs)), 2) if avgs else 0.0
+    return int(c1), int(c3), int(c5), mfr, mar
+
+
+def format_runtime(elapsed_sec):
+    """返回 (秒, 可读字符串)，例如 (125.3, '0h02m05.300s')。"""
+    sec = max(0.0, float(elapsed_sec))
+    h = int(sec // 3600)
+    m = int((sec % 3600) // 60)
+    s = sec - h * 3600 - m * 60
+    return sec, "%dh%02dm%06.3fs" % (h, m, s)
+
+
+def write_continual_metrics(out_root, lines, elapsed_sec=None):
+    """写入 {mmddHHMM}_continual_metrics.txt，首行带 run_stamp。返回路径。"""
+    stamp = run_stamp_mmddhhmm()
+    os.makedirs(out_root, exist_ok=True)
+    path = os.path.join(out_root, "%s_continual_metrics.txt" % stamp)
+    extra = []
+    if elapsed_sec is not None:
+        sec, hms = format_runtime(elapsed_sec)
+        extra = ["runtime_sec=%.3f" % sec, "runtime=%s" % hms]
+    body = ["run_stamp=%s" % stamp] + extra + list(lines)
+    with open(path, "w") as f:
+        f.write("\n".join(body) + "\n")
+    return path
 
 
 def apply_deepfl_env_from_args(args):

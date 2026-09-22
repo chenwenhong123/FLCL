@@ -4,6 +4,8 @@ import os
 import pickle
 import random
 import sys
+import time
+from datetime import datetime
 from typing import Dict, List, Tuple
 
 import numpy as np
@@ -55,6 +57,12 @@ def _resolve_data_path(filename: str) -> str:
 
 def _result_dir(project: str) -> str:
     d = os.path.join(RESULT_ROOT, project)
+    os.makedirs(d, exist_ok=True)
+    return d
+
+
+def _run_out_dir(project: str, run_id: str) -> str:
+    d = os.path.join(_result_dir(project), run_id)
     os.makedirs(d, exist_ok=True)
     return d
 
@@ -202,12 +210,30 @@ def train_on_one_id(
 
 
 def calc_summary(ranks: List[int], mars: List[float]) -> Dict[str, float]:
-    if len(ranks) == 0:
-        return {"top1": 0.0, "top3": 0.0, "top5": 0.0, "mfr": 0.0, "mar": 0.0}
+    n = len(ranks)
+    if n == 0:
+        return {
+            "n": 0,
+            "top1": 0.0,
+            "top3": 0.0,
+            "top5": 0.0,
+            "top1_count": 0,
+            "top3_count": 0,
+            "top5_count": 0,
+            "mfr": 0.0,
+            "mar": 0.0,
+        }
+    top1_count = sum(1 for r in ranks if r == 0)
+    top3_count = sum(1 for r in ranks if r < 3)
+    top5_count = sum(1 for r in ranks if r < 5)
     return {
-        "top1": float(sum(1 for r in ranks if r == 0) / len(ranks)),
-        "top3": float(sum(1 for r in ranks if r < 3) / len(ranks)),
-        "top5": float(sum(1 for r in ranks if r < 5) / len(ranks)),
+        "n": n,
+        "top1": float(top1_count / n),
+        "top3": float(top3_count / n),
+        "top5": float(top5_count / n),
+        "top1_count": top1_count,
+        "top3_count": top3_count,
+        "top5_count": top5_count,
         "mfr": float(np.mean(ranks)),
         "mar": float(np.mean(mars)) if len(mars) > 0 else 0.0,
     }
@@ -231,6 +257,12 @@ def main():
     weight_decay = float(sys.argv[8]) if len(sys.argv) > 8 else 1e-4
     beta1 = float(sys.argv[9]) if len(sys.argv) > 9 else 0.9
     beta2 = float(sys.argv[10]) if len(sys.argv) > 10 else 0.999
+    run_t0 = time.perf_counter()
+    run_ts = datetime.now().strftime("%m%d%H%M")
+    run_id = (
+        f"adam_l2_base{base_epochs}_inc{inc_epochs}_lr{lr}_bs{batch_size}"
+        f"_warm{warmup_ids}_wd{weight_decay}_b1{beta1}_b2{beta2}_ts{run_ts}"
+    )
 
     set_seed(seed)
     args = init_args(project, lr, seed, batch_size)
@@ -347,6 +379,10 @@ def main():
                 "top1": summary["top1"],
                 "top3": summary["top3"],
                 "top5": summary["top5"],
+                "top1_count": summary["top1_count"],
+                "top3_count": summary["top3_count"],
+                "top5_count": summary["top5_count"],
+                "n": summary["n"],
                 "mfr": summary["mfr"],
                 "mar": summary["mar"],
                 "current_rank": cur_rank,
@@ -357,11 +393,8 @@ def main():
             f"[t={t}] online_top1={online_top1:.3f} acc_top1={acc_top1_t:.3f} acc_top3={acc_top3_t:.3f} bwt={bwt_t:.3f}"
         )
 
-    out_dir = _result_dir(project)
-    csv_path = os.path.join(
-        out_dir,
-        f"{project}_continual_adam_l2_metrics_base{base_epochs}_inc{inc_epochs}_lr{lr}_bs{batch_size}_warm{warmup_ids}_wd{weight_decay}.csv",
-    )
+    out_dir = _run_out_dir(project, run_id)
+    csv_path = os.path.join(out_dir, "metrics.csv")
     with open(csv_path, "w", newline="") as f:
         writer = csv.DictWriter(
             f,
@@ -374,6 +407,10 @@ def main():
                 "top1",
                 "top3",
                 "top5",
+                "top1_count",
+                "top3_count",
+                "top5_count",
+                "n",
                 "mfr",
                 "mar",
                 "current_rank",
@@ -383,19 +420,15 @@ def main():
         writer.writeheader()
         writer.writerows(rows)
 
-    model_path = os.path.join(
-        out_dir,
-        f"{project}_continual_adam_l2_model_base{base_epochs}_inc{inc_epochs}_lr{lr}_bs{batch_size}_warm{warmup_ids}_wd{weight_decay}.pt",
-    )
+    model_path = os.path.join(out_dir, "model.pt")
     torch.save(model.state_dict(), model_path)
 
-    summary_path = os.path.join(
-        out_dir,
-        f"{project}_continual_adam_l2_summary_base{base_epochs}_inc{inc_epochs}_lr{lr}_bs{batch_size}_warm{warmup_ids}_wd{weight_decay}.txt",
-    )
+    runtime_seconds = time.perf_counter() - run_t0
+    summary_path = os.path.join(out_dir, "summary.txt")
     last = rows[-1] if len(rows) > 0 else {}
     with open(summary_path, "w") as f:
         f.write(f"project: {project}\n")
+        f.write(f"run_id: {run_id}\n")
         f.write(f"device: {DEVICE}\n")
         f.write(f"warmup_ids: {warmup_ids}\n")
         f.write(f"base_epochs: {base_epochs}\n")
@@ -404,6 +437,7 @@ def main():
         f.write(f"adam_beta1: {beta1}\n")
         f.write(f"adam_beta2: {beta2}\n")
         f.write(f"selected_base_id: {best_base}\n")
+        f.write(f"runtime_seconds: {runtime_seconds:.3f}\n")
         if last:
             f.write(f"final_online_top1_t: {last['online_top1_t']:.6f}\n")
             f.write(f"final_acc_top1_t: {last['acc_top1_t']:.6f}\n")
@@ -412,6 +446,10 @@ def main():
             f.write(f"final_top1: {last['top1']:.6f}\n")
             f.write(f"final_top3: {last['top3']:.6f}\n")
             f.write(f"final_top5: {last['top5']:.6f}\n")
+            f.write(f"final_top1_count: {int(last['top1_count'])}\n")
+            f.write(f"final_top3_count: {int(last['top3_count'])}\n")
+            f.write(f"final_top5_count: {int(last['top5_count'])}\n")
+            f.write(f"final_n: {int(last['n'])}\n")
             f.write(f"final_mfr: {last['mfr']:.6f}\n")
             f.write(f"final_mar: {last['mar']:.6f}\n")
 

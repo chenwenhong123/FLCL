@@ -1,6 +1,10 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+CODE_DIR="$(cd "${SCRIPT_DIR}/.." && pwd)"
+cd "${CODE_DIR}"
+
 # 汇总 run_local_grid_replay_ewc_gem.sh 的归档结果
 # 输入：grid_outputs/{ewc,gem}/*_summary.txt
 # 输出：
@@ -9,7 +13,7 @@ set -euo pipefail
 #   grid_outputs/grid_summary_best_macro_by_strategy.csv
 #
 # 用法：
-#   bash summarize_local_grid_results.sh
+#   bash scripts/summarize_local_grid_results.sh
 
 BASE_DIR="${BASE_DIR:-grid_outputs}"
 OUT_ALL="${OUT_ALL:-${BASE_DIR}/grid_summary_all.csv}"
@@ -63,6 +67,10 @@ for strategy in ["ewc", "gem"]:
             "final_top1": float(info.get("final_top1", "nan")),
             "final_top3": float(info.get("final_top3", "nan")),
             "final_top5": float(info.get("final_top5", "nan")),
+            "final_top1_count": float(info.get("final_top1_count", "nan")),
+            "final_top3_count": float(info.get("final_top3_count", "nan")),
+            "final_top5_count": float(info.get("final_top5_count", "nan")),
+            "final_n": float(info.get("final_n", "nan")),
             "final_mfr": float(info.get("final_mfr", "nan")),
             "final_mar": float(info.get("final_mar", "nan")),
             "final_bwt_t": float(info.get("final_bwt_t", "nan")),
@@ -111,6 +119,10 @@ for (strategy, tag), rows in by_strategy_tag.items():
         "macro_top1": mean([x["final_top1"] for x in rows]),
         "macro_top3": mean([x["final_top3"] for x in rows]),
         "macro_top5": mean([x["final_top5"] for x in rows]),
+        "macro_top1_count": mean([x["final_top1_count"] for x in rows]),
+        "macro_top3_count": mean([x["final_top3_count"] for x in rows]),
+        "macro_top5_count": mean([x["final_top5_count"] for x in rows]),
+        "macro_n": mean([x["final_n"] for x in rows]),
         "macro_mfr": mean([x["final_mfr"] for x in rows]),
         "macro_mar": mean([x["final_mar"] for x in rows]),
         "macro_bwt_t": mean([x["final_bwt_t"] for x in rows]),

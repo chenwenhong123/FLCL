@@ -22,7 +22,7 @@ def initializeResult(allsub,tvector):
     for i in range(Overall):
         modelvector=[]
         for m in range(modelsize):
-            a=[0,0,0,0.00,0.00]            #top1 top3, top5, mfr, mar
+            a=[0,0,0,0.00,0.00,0.00]            #top1 top3, top5, mfr, mar, runtime_sec
             array=np.array(a,dtype=object)           
             modelvector.append(array)
         resultMatrix.append(modelvector)   #initialize result matrix 
@@ -77,6 +77,7 @@ def readDeepResult(dir,subs,tech,dnns,epoch,vers,resultBysub,techsvector,ResultD
           if dnns[d] == model:
             tops=np.zeros(4)
             ranks=np.zeros(2)
+            runtime_sec=0.0
             actual_ver=0
             # iterate all versions of the current proj                                               
             for v in range(ver):
@@ -99,17 +100,28 @@ def readDeepResult(dir,subs,tech,dnns,epoch,vers,resultBysub,techsvector,ResultD
                 ranks[0]+=min
                 ranks[1]+=avg
                 actual_ver+=1
+                rt_path=os.path.join(out_dir, sub, v, tech, dnns[d]+'-'+loss+'-runtime.txt')
+                if os.path.isfile(rt_path):
+                    with open(rt_path) as rtf:
+                        for ln in rtf:
+                            if ln.startswith('runtime_sec='):
+                                try:
+                                    runtime_sec += float(ln.split('=',1)[1].strip())
+                                except ValueError:
+                                    pass
+                                break
 
             if actual_ver == 0:
                 continue
             ranks=ranks/actual_ver    
-            print(sub,tech, epoch,dnns[d], tops,ranks)      # print each result
+            print(sub,tech, epoch,dnns[d], tops,ranks, 'runtime_sec=%.3f'%runtime_sec)
             truevers[s]=actual_ver
             result=(int(tops[0]),
                     int(tops[1]),
                     int(tops[2]),
                     round(float(ranks[0]),2),
-                    round(float(ranks[1]),2))
+                    round(float(ranks[1]),2),
+                    round(float(runtime_sec),3))
             result=np.array(result, dtype=object)
                 
             subindex=s
@@ -132,11 +144,13 @@ def CalculateOverall(resultBysub,truevers,techsvector):
             resultBysub[len(resultBysub)-1][m][2]=resultBysub[len(resultBysub)-1][m][2]+resultBysub[s][m][2]
             resultBysub[len(resultBysub)-1][m][3]=resultBysub[len(resultBysub)-1][m][3]+resultBysub[s][m][3]*truevers[s]
             resultBysub[len(resultBysub)-1][m][4]=resultBysub[len(resultBysub)-1][m][4]+resultBysub[s][m][4]*truevers[s]
+            resultBysub[len(resultBysub)-1][m][5]=resultBysub[len(resultBysub)-1][m][5]+resultBysub[s][m][5]
             
     
     for m in range(len(techsvector)):
         resultBysub[len(resultBysub)-1][m][3]=round(resultBysub[len(resultBysub)-1][m][3]/verssum,2)
-        resultBysub[len(resultBysub)-1][m][4]=round(resultBysub[len(resultBysub)-1][m][4]/verssum,2) 
+        resultBysub[len(resultBysub)-1][m][4]=round(resultBysub[len(resultBysub)-1][m][4]/verssum,2)
+        resultBysub[len(resultBysub)-1][m][5]=round(float(resultBysub[len(resultBysub)-1][m][5]),3) 
 
 
 
@@ -191,14 +205,14 @@ def main():
     CalculateOverall(resultBysub,truevers,techsvector)
     
     m = dnns.index(model)
-    print("        Top-1   Top-3   Top-5   MFR     MAR")
+    print("        Top-1   Top-3   Top-5   MFR     MAR     Time")
     for sub in range(len(subs)):
         sys.stdout.write(subs[sub]+"\t")
-        for metric in range(0,5):   # top1 top2...mar
+        for metric in range(0,6):   # top1 top3 top5 mfr mar runtime
             sys.stdout.write(str(resultBysub[sub][m][metric])+"\t")
         print('')
     sys.stdout.write("Overall" + "\t")
-    for metric in range(0,5):   # top1 top2...mar
+    for metric in range(0,6):
         sys.stdout.write(str(resultBysub[len(subs)][m][metric])+"\t")
     print('')
 if __name__ == '__main__':
